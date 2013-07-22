@@ -33,7 +33,7 @@ type Result struct {
 }
 
 type Context struct {
-	Client http.Client
+	Client *http.Client
 	Config
 }
 
@@ -53,6 +53,7 @@ type gonanRun struct {
 	Name       string
 	CancelChan chan chan bool
 	Canceled   bool
+	ClientCache chan *http.Client
 }
 
 type gonanError struct {
@@ -74,6 +75,10 @@ func (rt *gonanRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	req.Header["User-Agent"] = []string{fmt.Sprintf("Godzilla/1.0 (gonan; flow=%s)", *rt.FlowName)}
 	rt.NumRequests++
 	return rt.Transport.RoundTrip(req)
+}
+
+func (rt *gonanRoundTripper) Reset() {
+	rt.NumRequests = 0
 }
 
 const errInvalidArgs = "invalid arguments"
@@ -103,14 +108,33 @@ func validateConfig(config *Config) error {
 
 func (r *gonanRun) processFlow(result *Result) error {
 	context := new(Context)
-	rt := &gonanRoundTripper{&http.Transport{Proxy: http.ProxyFromEnvironment}, &r.Canceled, &r.Name, 0}
-	rt.Transport.ResponseHeaderTimeout = time.Duration(r.Config.ReadTimeout) * time.Second
-	jar, _ := cookiejar.New(nil)
-	context.Client = http.Client{rt, nil, jar}
+	client := r.getClient()
+	defer r.releaseClient(client)
+	context.Client = client
 	context.Config = r.Config
 	err := r.Flow.Run(context)
-	atomic.AddInt64(&result.NumHttpRequests, int64(rt.NumRequests))
+	atomic.AddInt64(&result.NumHttpRequests, int64(client.Transport.(*gonanRoundTripper).NumRequests))
 	return err
+}
+
+func (r *gonanRun) getClient() *http.Client {
+	return <- r.ClientCache
+}
+
+func (r *gonanRun) releaseClient(client *http.Client) {
+	client.Transport.(*gonanRoundTripper).Reset()
+	r.ClientCache <- client 
+}
+
+func (r *gonanRun) initClientCache() {
+	r.ClientCache = make(chan *http.Client, r.Config.Concurrency)
+	for i := 0; i < r.Config.Concurrency; i++ {
+		rt := &gonanRoundTripper{&http.Transport{Proxy: http.ProxyFromEnvironment, DisableKeepAlives: false}, &r.Canceled, &r.Name, 0}
+		rt.Transport.ResponseHeaderTimeout = time.Duration(r.Config.ReadTimeout) * time.Second
+		jar, _ := cookiejar.New(nil)
+		client := &http.Client{rt, nil, jar}
+		r.ClientCache <- client
+	}
 }
 
 func (r *gonanRun) ExecuteAsync() (*Result, chan error) {
@@ -123,6 +147,7 @@ func (r *gonanRun) ExecuteAsync() (*Result, chan error) {
 	errchan := make(chan error)
 	result.StartTime = time.Now()
 
+	r.initClientCache()
 	go func() {
 		var cancelchan chan bool
 		var err error
@@ -178,6 +203,6 @@ func CreateRun(flow Flow, config *Config) (Run, error) {
 		return nil, err
 	}
 	run := &gonanRun{flow, *config,
-		reflect.TypeOf(flow).Elem().Name(), make(chan chan bool), false}
+		reflect.TypeOf(flow).Elem().Name(), make(chan chan bool), false, nil}
 	return run, nil
 }
